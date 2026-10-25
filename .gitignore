@@ -1,0 +1,7 @@
+Frontend/node_modules/
+Frontend/dist/
+Backend/.venv/
+Backend/__pycache__/
+Backend/model/__pycache__/
+Backend/smartskillpath_users.db
+Backend/.env

@@ -1,0 +1,72 @@
+"""API adapter for the SmartSkillPath web UI. The existing Streamlit model remains unchanged."""
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr, Field
+from pathlib import Path
+import sqlite3, secrets, hashlib, os, sys
+
+ROOT=Path(__file__).resolve().parent
+sys.path.insert(0,str(ROOT))
+from model.recommendation_model import recommend_skills
+DB=ROOT/'smartskillpath_users.db'
+app=FastAPI(title='SmartSkillPath API',version='1.0.0',description='API adapter for existing SmartSkillPath recommendation model')
+app.add_middleware(CORSMiddleware,allow_origins=['http://localhost:5173','http://127.0.0.1:5173'],allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
+
+def connect():
+ c=sqlite3.connect(DB);c.row_factory=sqlite3.Row;return c
+
+def init_db():
+ with connect() as c:
+  c.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,email TEXT UNIQUE NOT NULL,salt TEXT NOT NULL,password_hash TEXT NOT NULL,token TEXT UNIQUE)')
+  c.execute('CREATE TABLE IF NOT EXISTS goals (user_id INTEGER NOT NULL,goal TEXT NOT NULL,position INTEGER NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id))')
+init_db()
+class RecommendationInput(BaseModel):
+ career:str=Field(min_length=2,max_length=100)
+ current_skills:list[str]=Field(min_length=1,max_length=50)
+class AuthInput(BaseModel):
+ email:EmailStr
+ password:str=Field(min_length=8,max_length=200)
+class GoalsInput(BaseModel):
+ goals:list[str]=Field(max_length=100)
+def password_hash(password,salt): return hashlib.pbkdf2_hmac('sha256',password.encode(),salt.encode(),240000).hex()
+def user_from_token(token):
+ if not token:return None
+ with connect() as c:return c.execute('SELECT id,email FROM users WHERE token=?',(token,)).fetchone()
+@app.get('/api/health')
+def health():return {'status':'ok','model':'existing recommendation model loaded on request'}
+@app.post('/api/recommend')
+def recommend(payload:RecommendationInput):
+ try:
+  result=recommend_skills(', '.join(payload.current_skills),payload.career)
+  # Ensure a predictable JSON object for the frontend.
+  return result
+ except Exception as exc:
+  raise HTTPException(status_code=500,detail='Recommendation failed. Check that the cleaned datasets and Python dependencies are installed.') from exc
+@app.post('/api/auth/register')
+def register(payload:AuthInput):
+ email=payload.email.lower().strip();salt=secrets.token_hex(16);ph=password_hash(payload.password,salt);token=secrets.token_urlsafe(32)
+ try:
+  with connect() as c:c.execute('INSERT INTO users(email,salt,password_hash,token) VALUES(?,?,?,?)',(email,salt,ph,token))
+ except sqlite3.IntegrityError:raise HTTPException(status_code=409,detail='An account with this email already exists. Please sign in.')
+ return {'email':email,'token':token}
+@app.post('/api/auth/login')
+def login(payload:AuthInput):
+ with connect() as c:row=c.execute('SELECT * FROM users WHERE email=?',(payload.email.lower().strip(),)).fetchone()
+ if not row or password_hash(payload.password,row['salt'])!=row['password_hash']:raise HTTPException(status_code=401,detail='Email or password is incorrect.')
+ token=secrets.token_urlsafe(32)
+ with connect() as c:c.execute('UPDATE users SET token=? WHERE id=?',(token,row['id']))
+ return {'email':row['email'],'token':token}
+@app.get('/api/goals')
+def get_goals(authorization:str|None=Header(default=None)):
+ user=user_from_token(authorization.removeprefix('Bearer ').strip() if authorization else None)
+ if not user:raise HTTPException(status_code=401,detail='Please sign in again.')
+ with connect() as c:rows=c.execute('SELECT goal FROM goals WHERE user_id=? ORDER BY position',(user['id'],)).fetchall()
+ return {'goals':[r['goal'] for r in rows]}
+@app.post('/api/goals')
+def save_goals(payload:GoalsInput,authorization:str|None=Header(default=None)):
+ user=user_from_token(authorization.removeprefix('Bearer ').strip() if authorization else None)
+ if not user:raise HTTPException(status_code=401,detail='Please sign in again.')
+ with connect() as c:
+  c.execute('DELETE FROM goals WHERE user_id=?',(user['id'],))
+  c.executemany('INSERT INTO goals(user_id,goal,position) VALUES(?,?,?)',[(user['id'],g[:300],i) for i,g in enumerate(payload.goals)])
+ return {'saved':len(payload.goals)}
